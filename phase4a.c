@@ -3,9 +3,10 @@
 #include "phase4_usermode.h"
 #include <string.h>
 #include <stdlib.h>
+#include "usloss.h"
 
 void phase4_init(void) {
-    return;
+    //systemCallVec[SYS_SLEEP] = kernSleep();
 }
 
 void phase4_start_service_processes(void) {
@@ -13,6 +14,7 @@ void phase4_start_service_processes(void) {
 }
 
 int  kernSleep(int seconds) {
+    
     return 0;
 }
 
