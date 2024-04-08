@@ -17,6 +17,7 @@ typedef struct SleepProc{
 int clock_ticks = 0; // amount of clock ticks that have occurred
 int sleep_mailbox; // mailbox id for processes making sleep requests 
 int sleep_lock; // lock for sleep handler
+int totalSleepingProcs = 0;
 
 SleepProc sleepTable[MAXPROC]; // memory for processes created
 SleepProc *sleepQueue = NULL; // queue for waking up sleeping procs
@@ -45,13 +46,24 @@ void phase4_start_service_processes(void)
 }
 
 int clockDeviceDriver(char *arg) {
+    
     int status;
     while (1) {
+        //USLOSS_Console("clockDeviceDriver has been called\n");
         waitDevice(USLOSS_CLOCK_DEV, 0, &status); 
+        //USLOSS_Console("about to enter CS\n");
+        lock(sleep_lock);
+        //USLOSS_Console("lock acquired\n");
         clock_ticks++; 
+        
+   
+        // USLOSS_Console("current clock tick: %d\n", clock_ticks);
+
+        // if (sleepQueue != NULL)  {
+        //     USLOSS_Console("wake up time: %d\n", sleepQueue->wakeupTime);
+        // }
 
         if (sleepQueue != NULL && sleepQueue->wakeupTime <= clock_ticks) {
-            
             int cur_pid = sleepQueue->pid;
             unblockProc(cur_pid);
 
@@ -59,23 +71,31 @@ int clockDeviceDriver(char *arg) {
             temp->next = NULL;
             temp->pid = -1;
             temp->wakeupTime = -1;
+            
 
-            // remove process from queue
             sleepQueue = sleepQueue->next;
+            totalSleepingProcs--;
         }
+       // USLOSS_Console("exiting CS\n");
+        unlock(sleep_lock);
     }
+
     return 0;
 }
 
 void addToQueue(SleepProc* request) {
-    SleepProc *head = sleepQueue;
-    if (head == NULL) {
-        head = request;
+    
+    if (sleepQueue == NULL) {
+        sleepQueue = request;
+        totalSleepingProcs++;
         return;
     }
-    else if (head->wakeupTime > request->wakeupTime) {
+
+    SleepProc *head = sleepQueue;
+    if (head->wakeupTime > request->wakeupTime) {
         request->next = head;
         head = request;
+        totalSleepingProcs++;
         return;
     }
 
@@ -91,20 +111,23 @@ void addToQueue(SleepProc* request) {
         head->next = request;
         request->next = temp;
     }
+
+    totalSleepingProcs++;
 }
 
 void sleepHandler(USLOSS_Sysargs *sysargs) {
-    lock(sleep_lock);
+    
     int seconds = (int)(long) sysargs->arg1;
 
     int res = kernSleep(seconds);
 
     sysargs->arg4 = (void *)(long) res;
-    unlock(sleep_lock);
 }
  
 int kernSleep(int seconds)
 {
+    lock(sleep_lock);
+
     // invalid argument
     if (seconds < 0) {
         return -1;
@@ -119,6 +142,8 @@ int kernSleep(int seconds)
     request->next = NULL;
 
     addToQueue(request);
+
+    unlock(sleep_lock);
     blockMe(12);
 
     return 0;
