@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-typedef struct SleepProc{
+typedef struct SleepProc {
     int pid;
     int wakeupTime;
     struct SleepProc* next;
@@ -17,7 +17,7 @@ typedef struct SleepProc{
 int clock_ticks = 0; // amount of clock ticks that have occurred
 int sleep_mailbox; // mailbox id for processes making sleep requests 
 int sleep_lock; // lock for sleep handler
-int totalSleepingProcs = 0;
+int totalSleepingProcs = 0; // total number of sleeping procs in queue
 
 SleepProc sleepTable[MAXPROC]; // memory for processes created
 SleepProc *sleepQueue = NULL; // queue for waking up sleeping procs
@@ -46,37 +46,20 @@ void phase4_start_service_processes(void)
 }
 
 int clockDeviceDriver(char *arg) {
-    
     int status;
     while (1) {
-        //USLOSS_Console("clockDeviceDriver has been called\n");
         waitDevice(USLOSS_CLOCK_DEV, 0, &status); 
-        //USLOSS_Console("about to enter CS\n");
+        
         lock(sleep_lock);
-        //USLOSS_Console("lock acquired\n");
         clock_ticks++; 
         
-   
-        // USLOSS_Console("current clock tick: %d\n", clock_ticks);
-
-        // if (sleepQueue != NULL)  {
-        //     USLOSS_Console("wake up time: %d\n", sleepQueue->wakeupTime);
-        // }
-
-        if (sleepQueue != NULL && sleepQueue->wakeupTime <= clock_ticks) {
-            int cur_pid = sleepQueue->pid;
-            unblockProc(cur_pid);
-
-            SleepProc *temp = &sleepTable[cur_pid%MAXPROC];
-            temp->next = NULL;
-            temp->pid = -1;
-            temp->wakeupTime = -1;
-            
-
+        // iterating through the sleep queue to wake up any processes whose time is up
+        while (sleepQueue != NULL && sleepQueue->wakeupTime <= clock_ticks) {
+            SleepProc *toWake = sleepQueue;        
+            unblockProc(toWake->pid); 
             sleepQueue = sleepQueue->next;
-            totalSleepingProcs--;
         }
-       // USLOSS_Console("exiting CS\n");
+
         unlock(sleep_lock);
     }
 
@@ -84,39 +67,33 @@ int clockDeviceDriver(char *arg) {
 }
 
 void addToQueue(SleepProc* request) {
-    
     if (sleepQueue == NULL) {
         sleepQueue = request;
-        totalSleepingProcs++;
-        return;
-    }
-
-    SleepProc *head = sleepQueue;
-    if (head->wakeupTime > request->wakeupTime) {
-        request->next = head;
-        head = request;
-        totalSleepingProcs++;
-        return;
-    }
-
-    while (head->next != NULL && head->next->wakeupTime < request->wakeupTime) {
-        head = head->next;
-    }
-
-    if (head->next == NULL) {
-        head->next = request;
-    }
+    } 
     else {
-        SleepProc *temp = head->next;
-        head->next = request;
-        request->next = temp;
+
+        // finds the next place to insert process in the sleep queue 
+        SleepProc *prev = NULL;
+        SleepProc *current = sleepQueue;
+        while (current != NULL && current->wakeupTime <= request->wakeupTime) {
+            prev = current;
+            current = current->next;
+        }
+        if (prev == NULL) { 
+            request->next = sleepQueue;
+            sleepQueue = request;
+        } 
+        else { 
+            request->next = prev->next;
+            prev->next = request;
+        }
     }
 
     totalSleepingProcs++;
 }
 
-void sleepHandler(USLOSS_Sysargs *sysargs) {
-    
+// system call which calls the kernalSleep when triggered by the user
+void sleepHandler(USLOSS_Sysargs *sysargs) {   
     int seconds = (int)(long) sysargs->arg1;
 
     int res = kernSleep(seconds);
