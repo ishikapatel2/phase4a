@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <phase1.h>
 #include <phase2.h>
@@ -13,12 +12,6 @@ typedef struct SleepProc {
     int wakeupTime;
     struct SleepProc* next;
 } SleepProc;
-
-typedef struct WriteRequest {
-    char buffer[MAXLINE + 1]; // data to be written.
-    int length;                // length of the data.
-    int mboxID;
-} WriteRequest;
 
 int clock_ticks = 0; // amount of clock ticks that have occurred
 int sleep_lock; // lock for sleep handler
@@ -35,7 +28,6 @@ void lock(int lockId);
 void unlock(int lockId);
 int clockDeviceDriver(char *arg);
 int TerminalDeviceDriver(char *arg);
-void addToQueue(SleepProc* request);
 void sleepHandler(USLOSS_Sysargs *sysargs);
 void termReadHandler(USLOSS_Sysargs *sysargs);
 void termWriteHandler(USLOSS_Sysargs *sysargs);
@@ -55,9 +47,19 @@ void phase4_init(void) {
     // for terminal
     for (int i = 0; i < USLOSS_TERM_UNITS; i++) {
         termLocks[i] = MboxCreate(1, 0); 
-        writeRequestMboxIDs[i] = MboxCreate(10, sizeof(WriteRequest));
+        //writeRequestMboxIDs[i] = MboxCreate(10, sizeof(WriteRequest));
+        writeRequestMboxIDs[i] = MboxCreate(0,0);
+
     }
 
+    int control = 0;
+    control = USLOSS_TERM_CTRL_XMIT_INT(control);
+    control = USLOSS_TERM_CTRL_RECV_INT(control);
+
+    USLOSS_DeviceOutput(USLOSS_TERM_DEV, 0, (void*)(long) control);
+    USLOSS_DeviceOutput(USLOSS_TERM_DEV, 1, (void*)(long) control);
+    USLOSS_DeviceOutput(USLOSS_TERM_DEV, 2, (void*)(long) control);
+    USLOSS_DeviceOutput(USLOSS_TERM_DEV, 3, (void*)(long) control);
 }
 
 void phase4_start_service_processes(void)
@@ -77,40 +79,32 @@ int kernTermRead(char *buffer, int bufferSize, int unitID, int *numCharsRead)
 
 int kernTermWrite(char *buffer, int bufferSize, int unitID, int *numCharsWritten)
 {
+    //USLOSS_Console("in kernTermWrite function\n");
     // invalid input
     if (unitID < 0 || unitID >= USLOSS_TERM_UNITS || buffer == NULL || bufferSize <= 0 || bufferSize > MAXLINE) {
         return -1; 
     }
 
-    // initialize the write request
-    WriteRequest request;
-    strncpy(request.buffer, buffer, bufferSize); // Copy the buffer content to the request
-    request.buffer[bufferSize] = '\0'; // Ensure null-termination
-    request.length = bufferSize;
-    request.mboxID = MboxCreate(0, 0); // Create a zero-slot mailbox for signaling completion
+    //USLOSS_Console("beginnging to copy characters to term %d\n", unitID);
+    for (int i = 0; i < bufferSize; i++){
+        
+        // wait to write
+        int status = MboxRecv(writeRequestMboxIDs[unitID], NULL, 0);
 
-    if (request.mboxID < 0) {
-        return -1;
-    }
+        
+        //int control = USLOSS_TERM_CTRL_CHAR(0, buffer[i]) | USLOSS_TERM_CTRL_XMIT_CHAR | USLOSS_TERM_CTRL_XMIT_INT;
 
-    // send write request to the corresponding terminal's mailbox
-    int sendStatus = MboxSend(writeRequestMboxIDs[unitID], &request, sizeof(request));
-    if (sendStatus < 0) {
-        MboxRelease(request.mboxID);
-        return -1;
-    }
+        int control = 0x1;
+        control |= 0x2;
+        control |= 0x4;
+        control |= (buffer[i] << 8);
 
-    // wait for the write operation to complete
-    MboxRecv(request.mboxID, NULL, 0);
-
-    // release mailbox
-    MboxRelease(request.mboxID); 
-
-    // update the number of characters written
-    if (numCharsWritten != NULL) {
-        *numCharsWritten = bufferSize;
-    }
-
+        if (USLOSS_DeviceOutput(USLOSS_TERM_DEV, unitID, (void *)(long)control) != USLOSS_DEV_OK) {
+            return -1;
+        }
+        *numCharsWritten += 1;
+        
+    }    
     return 0;
 }
 
@@ -120,7 +114,7 @@ void termReadHandler(USLOSS_Sysargs *sysargs) {
     int bufferSize = (int)(long)sysargs->arg2;
     int unitID = (int)(long)sysargs->arg3;
     int numCharsRead = 0;
-
+    
     int res = kernTermRead(buffer, bufferSize, unitID, &numCharsRead);
 
     sysargs->arg2 = (void *)(long) numCharsRead;
@@ -129,12 +123,16 @@ void termReadHandler(USLOSS_Sysargs *sysargs) {
 
 // system call which calls the kernTermWrite when triggered by the user
 void termWriteHandler(USLOSS_Sysargs *sysargs) {
+    
     char *buffer = (char *)sysargs->arg1;
     int bufferSize = (int)(long)sysargs->arg2;
     int unitID = (int)(long)sysargs->arg3;
     int numCharsWritten = 0;
 
+    //USLOSS_Console("acquiring lockkernTermWrite\n");
+    lock(termLocks[unitID]);
     int res = kernTermWrite(buffer, bufferSize, unitID, &numCharsWritten);
+    unlock(termLocks[unitID]);
 
     sysargs->arg2 = (void *)(long) numCharsWritten;
     sysargs->arg4 = (void *)(long) res;
@@ -150,11 +148,13 @@ void sleepHandler(USLOSS_Sysargs *sysargs) {
 }
 
 int TerminalDeviceDriver(char *arg) {
+    //USLOSS_Console("calling terminal device driver\n");
     int unitID = atoi(arg);
     int status;
+
     while (1) {
         waitDevice(USLOSS_TERM_DEV, unitID, &status); 
-
+    
         // checks if terminal interrupt needs to read a character
         // if (USLOSS_TERM_STAT_RECV(status) == USLOSS_DEV_BUSY) {
         //     //char receivedChar = USLOSS_TERM_STAT_CHAR(status);
@@ -163,29 +163,9 @@ int TerminalDeviceDriver(char *arg) {
 
         // checks if terminal is ready for writing a character
         if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY) {
-            WriteRequest request;
-
-            // checks if there are pending write requests for this terminal
-            if (MboxCondRecv(writeRequestMboxIDs[unitID], &request, sizeof(request)) > 0) {
-                
-                // If the current request is not fully written, write the next character
-                for (int i = 0; i < request.length; i++) {
-                    // int control = (request.buffer[i] & 0xFF) << 8; // Character to transmit.
-                    // control |= USLOSS_TERM_CTRL_XMIT_CHAR; // Bit to start transmission.
-                    // control |= USLOSS_TERM_CTRL_RECV_INT;  // Enable receive interrupts as an example.
-                    int control = 0x1;
-                    control |= 0x2;
-                    control |= 0x4;
-                    control |= (request.buffer[i] << 8);
-                    USLOSS_DeviceOutput(USLOSS_TERM_DEV, unitID, (void *)(long)control);
-                
-                }   
-            
-            }
-             MboxSend(request.mboxID, NULL, 0);
+            MboxCondSend(writeRequestMboxIDs[unitID], NULL, 0);
         }
-
-       
+        
     }
 
     return 0;
@@ -212,7 +192,24 @@ int clockDeviceDriver(char *arg) {
     return 0;
 }
 
-void addToQueue(SleepProc* request) {
+int kernSleep(int seconds)
+{
+    lock(sleep_lock);
+
+    // invalid argument
+    if (seconds < 0) {
+        return -1;
+    }
+
+    int wakeup_tick = clock_ticks + (seconds * 10);
+    int cur_pid = getpid();
+
+    SleepProc *request = &sleepTable[cur_pid % MAXPROC];
+    request->pid = cur_pid;
+    request->wakeupTime = wakeup_tick;
+    request->next = NULL;
+
+    // add to sleep queue
     if (sleepQueue == NULL) {
         sleepQueue = request;
     } 
@@ -236,27 +233,6 @@ void addToQueue(SleepProc* request) {
     }
 
     totalSleepingProcs++;
-}
-
- 
-int kernSleep(int seconds)
-{
-    lock(sleep_lock);
-
-    // invalid argument
-    if (seconds < 0) {
-        return -1;
-    }
-
-    int wakeup_tick = clock_ticks + (seconds * 10);
-    int cur_pid = getpid();
-
-    SleepProc *request = &sleepTable[cur_pid % MAXPROC];
-    request->pid = cur_pid;
-    request->wakeupTime = wakeup_tick;
-    request->next = NULL;
-
-    addToQueue(request);
 
     unlock(sleep_lock);
     blockMe(12);
