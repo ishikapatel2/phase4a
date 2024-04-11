@@ -35,7 +35,6 @@ void sleepHandler(USLOSS_Sysargs *sysargs);
 void termReadHandler(USLOSS_Sysargs *sysargs);
 void termWriteHandler(USLOSS_Sysargs *sysargs);
 
-
 void phase4_init(void) {
     memset(sleepTable, 0, sizeof(sleepTable));
 
@@ -126,7 +125,7 @@ int kernTermRead(char *buffer, int bufferSize, int unitID, int *numCharsRead)
     // set number of characters read to bufferSize since we only copied a max of bufferSize characters
     if (*numCharsRead > bufferSize){
         *numCharsRead = bufferSize;
-        
+
     }
     buffer[*numCharsRead] = '\0';
     return 0;
@@ -145,6 +144,7 @@ int kernTermWrite(char *buffer, int bufferSize, int unitID, int *numCharsWritten
         
         // wait to write
         MboxRecv(writeRequestMboxIDs[unitID], NULL, 0);
+        
         int control = 0x1;
         control |= 0x2;
         control |= 0x4;
