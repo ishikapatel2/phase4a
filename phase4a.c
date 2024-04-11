@@ -13,6 +13,12 @@ typedef struct SleepProc {
     struct SleepProc* next;
 } SleepProc;
 
+typedef struct ReadBuffer {
+    char data[MAXLINE + 1];
+    int  length;
+    int  mboxID;
+} ReadBuffer;
+
 int clock_ticks = 0; // amount of clock ticks that have occurred
 int sleep_lock; // lock for sleep handler
 int totalSleepingProcs = 0; // total number of sleeping procs in queue
@@ -20,8 +26,14 @@ int totalSleepingProcs = 0; // total number of sleeping procs in queue
 SleepProc sleepTable[MAXPROC]; // memory for processes created
 SleepProc *sleepQueue = NULL; // queue for waking up sleeping procs
 
-int termLocks[USLOSS_TERM_UNITS]; // lock for each of 4 terminal devices
+int termWriteLocks[USLOSS_TERM_UNITS]; // write lock for each of 4 terminal devices
 int writeRequestMboxIDs[USLOSS_TERM_UNITS]; // holds mailbox ids for terminal write requests.
+
+int termReadLocks[USLOSS_TERM_UNITS]; // read lock for each of 4 terminal devices
+ReadBuffer readBuffers[USLOSS_TERM_UNITS][10]; 
+int readBuffersMbox[USLOSS_TERM_UNITS]; // Mailboxes for read buffers.
+int readBufferInUse[USLOSS_TERM_UNITS]; // Track buffers in use.
+
 
 int kernSleep(int seconds);
 void lock(int lockId);
@@ -42,15 +54,24 @@ void phase4_init(void) {
 
     // for sleep
     sleep_lock = MboxCreate(1, 0);
-    // sleep_mailbox = MboxCreate(MAXPROC, sizeof(SleepProc));
 
     // for terminal
     for (int i = 0; i < USLOSS_TERM_UNITS; i++) {
-        termLocks[i] = MboxCreate(1, 0); 
-        //writeRequestMboxIDs[i] = MboxCreate(10, sizeof(WriteRequest));
+        termWriteLocks[i] = MboxCreate(1, 0); 
         writeRequestMboxIDs[i] = MboxCreate(0,0);
 
+        termReadLocks[i] = MboxCreate(1, 0); 
     }
+
+    for (int i = 0; i < USLOSS_TERM_UNITS; i++) {
+        for (int j = 0; j < 10; j++) {
+            readBuffers[i][j].mboxID = MboxCreate(1, sizeof(ReadBuffer));
+            readBuffers[i][j].length = 0;
+        }
+        readBufferInUse[i] = 0;
+        readBuffersMbox[i] = MboxCreate(10, sizeof(ReadBuffer));
+    }
+
 
     int control = 0;
     control = USLOSS_TERM_CTRL_XMIT_INT(control);
@@ -71,9 +92,72 @@ void phase4_start_service_processes(void)
     spork("TerminalDeviceDriver3", TerminalDeviceDriver, "3", USLOSS_MIN_STACK, 1);
 }
 
+int TerminalDeviceDriver(char *arg) {
+    //USLOSS_Console("calling terminal device driver\n");
+    int unitID = atoi(arg);
+    int status;
+
+    while (1) {
+        waitDevice(USLOSS_TERM_DEV, unitID, &status); 
+    
+        // checks if terminal interrupt needs to read a character
+        if (USLOSS_TERM_STAT_RECV(status) == USLOSS_DEV_BUSY) {
+
+            // get character from status register
+            char receivedChar = USLOSS_TERM_STAT_CHAR(status);
+
+            int index = readBufferInUse[unitID];
+
+            // check if the buffer is in use
+            if (index < 10) {
+
+                // save character to buffer that can be globally accessed
+                ReadBuffer *buff = &readBuffers[unitID][index];
+                buff->data[buff->length++] = receivedChar;
+                buff->data[buff->length] = '\0'; 
+
+                // deliver buffer to kernRead if new line character or buffer size reached limit
+                if (receivedChar == '\n' || buff->length == MAXLINE) {
+                    // send buffer to mailbox
+                    MboxSend(readBuffersMbox[unitID], buff, sizeof(ReadBuffer));
+
+                    // reset buffer for new data
+                    buff->length = 0; 
+                    // move to the next buffer
+                    readBufferInUse[unitID] = (index + 1) % 10; 
+                }
+            }
+        }
+
+        // checks if terminal is ready for writing a character
+        if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY) {
+            MboxCondSend(writeRequestMboxIDs[unitID], NULL, 0);
+        }
+        
+    }
+
+    return 0;
+}
+
 
 int kernTermRead(char *buffer, int bufferSize, int unitID, int *numCharsRead)
 {
+    if (unitID < 0 || unitID >= USLOSS_TERM_UNITS || buffer == NULL || bufferSize <= 0) {
+        return -1; 
+    }
+
+    ReadBuffer readBuff;
+    int result = MboxRecv(readBuffersMbox[unitID], &readBuff, sizeof(ReadBuffer));
+
+    if (result < 0) {
+        return 0;
+    } else {
+        int copyLength = (bufferSize - 1 < readBuff.length) ? bufferSize - 1 : readBuff.length;
+        strncpy(buffer, readBuff.data, copyLength);
+        buffer[copyLength] = '\0';
+        *numCharsRead = copyLength; 
+    }
+
     return 0;
 }
 
@@ -81,7 +165,7 @@ int kernTermWrite(char *buffer, int bufferSize, int unitID, int *numCharsWritten
 {
     //USLOSS_Console("in kernTermWrite function\n");
     // invalid input
-    if (unitID < 0 || unitID >= USLOSS_TERM_UNITS || buffer == NULL || bufferSize <= 0 || bufferSize > MAXLINE) {
+    if (unitID < 0 || unitID >= USLOSS_TERM_UNITS || buffer == NULL || bufferSize <= 0) {
         return -1; 
     }
 
@@ -89,11 +173,7 @@ int kernTermWrite(char *buffer, int bufferSize, int unitID, int *numCharsWritten
     for (int i = 0; i < bufferSize; i++){
         
         // wait to write
-        int status = MboxRecv(writeRequestMboxIDs[unitID], NULL, 0);
-
-        
-        //int control = USLOSS_TERM_CTRL_CHAR(0, buffer[i]) | USLOSS_TERM_CTRL_XMIT_CHAR | USLOSS_TERM_CTRL_XMIT_INT;
-
+        MboxRecv(writeRequestMboxIDs[unitID], NULL, 0);
         int control = 0x1;
         control |= 0x2;
         control |= 0x4;
@@ -115,7 +195,9 @@ void termReadHandler(USLOSS_Sysargs *sysargs) {
     int unitID = (int)(long)sysargs->arg3;
     int numCharsRead = 0;
     
+    //lock(termReadLocks[unitID]);
     int res = kernTermRead(buffer, bufferSize, unitID, &numCharsRead);
+    //unlock(termReadLocks[unitID]);
 
     sysargs->arg2 = (void *)(long) numCharsRead;
     sysargs->arg4 = (void *)(long) res;
@@ -130,9 +212,9 @@ void termWriteHandler(USLOSS_Sysargs *sysargs) {
     int numCharsWritten = 0;
 
     //USLOSS_Console("acquiring lockkernTermWrite\n");
-    lock(termLocks[unitID]);
+    lock(termWriteLocks[unitID]);
     int res = kernTermWrite(buffer, bufferSize, unitID, &numCharsWritten);
-    unlock(termLocks[unitID]);
+    unlock(termWriteLocks[unitID]);
 
     sysargs->arg2 = (void *)(long) numCharsWritten;
     sysargs->arg4 = (void *)(long) res;
@@ -145,30 +227,6 @@ void sleepHandler(USLOSS_Sysargs *sysargs) {
     int res = kernSleep(seconds);
 
     sysargs->arg4 = (void *)(long) res;
-}
-
-int TerminalDeviceDriver(char *arg) {
-    //USLOSS_Console("calling terminal device driver\n");
-    int unitID = atoi(arg);
-    int status;
-
-    while (1) {
-        waitDevice(USLOSS_TERM_DEV, unitID, &status); 
-    
-        // checks if terminal interrupt needs to read a character
-        // if (USLOSS_TERM_STAT_RECV(status) == USLOSS_DEV_BUSY) {
-        //     //char receivedChar = USLOSS_TERM_STAT_CHAR(status);
-        //     continue;
-        // }
-
-        // checks if terminal is ready for writing a character
-        if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY) {
-            MboxCondSend(writeRequestMboxIDs[unitID], NULL, 0);
-        }
-        
-    }
-
-    return 0;
 }
 
 int clockDeviceDriver(char *arg) {
@@ -247,10 +305,8 @@ int kernSleep(int seconds)
  */
 void lock(int lockId)
 {
-    if (MboxSend(lockId, NULL, 0) != 0)
-    {
-        USLOSS_Console("ERROR ERROR ERROR\n");
-    }
+    MboxSend(lockId, NULL, 0);
+    
 }
 
 /**
@@ -260,10 +316,8 @@ void lock(int lockId)
  */
 void unlock(int lockId)
 {
-    if (MboxRecv(lockId, NULL, 0) != 0)
-    {
-        USLOSS_Console("ERROR ERROR ERROR\n");
-    }
+    MboxRecv(lockId, NULL, 0);
+
 }
 
 // 4b
