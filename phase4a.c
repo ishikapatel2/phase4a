@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <phase1.h>
 #include <phase2.h>
@@ -13,12 +14,6 @@ typedef struct SleepProc {
     struct SleepProc* next;
 } SleepProc;
 
-typedef struct ReadBuffer {
-    char data[MAXLINE + 1];
-    int  length;
-    int  mboxID;
-} ReadBuffer;
-
 int clock_ticks = 0; // amount of clock ticks that have occurred
 int sleep_lock; // lock for sleep handler
 int totalSleepingProcs = 0; // total number of sleeping procs in queue
@@ -27,13 +22,9 @@ SleepProc sleepTable[MAXPROC]; // memory for processes created
 SleepProc *sleepQueue = NULL; // queue for waking up sleeping procs
 
 int termWriteLocks[USLOSS_TERM_UNITS]; // write lock for each of 4 terminal devices
-int writeRequestMboxIDs[USLOSS_TERM_UNITS]; // holds mailbox ids for terminal write requests.
+int writeRequestMboxIDs[USLOSS_TERM_UNITS]; // holds mailbox ids for terminal write requests
 
-int termReadLocks[USLOSS_TERM_UNITS]; // read lock for each of 4 terminal devices
-ReadBuffer readBuffers[USLOSS_TERM_UNITS][10]; 
-int readBuffersMbox[USLOSS_TERM_UNITS]; // Mailboxes for read buffers.
-int readBufferInUse[USLOSS_TERM_UNITS]; // Track buffers in use.
-
+int readBuffersMbox[USLOSS_TERM_UNITS]; // mailbox id for 10 buffers for each unit
 
 int kernSleep(int seconds);
 void lock(int lockId);
@@ -60,19 +51,10 @@ void phase4_init(void) {
         termWriteLocks[i] = MboxCreate(1, 0); 
         writeRequestMboxIDs[i] = MboxCreate(0,0);
 
-        termReadLocks[i] = MboxCreate(1, 0); 
+        readBuffersMbox[i] = MboxCreate(10, MAXLINE);
     }
 
-    for (int i = 0; i < USLOSS_TERM_UNITS; i++) {
-        for (int j = 0; j < 10; j++) {
-            readBuffers[i][j].mboxID = MboxCreate(1, sizeof(ReadBuffer));
-            readBuffers[i][j].length = 0;
-        }
-        readBufferInUse[i] = 0;
-        readBuffersMbox[i] = MboxCreate(10, sizeof(ReadBuffer));
-    }
-
-
+    // enabling interrupts for terminal units
     int control = 0;
     control = USLOSS_TERM_CTRL_XMIT_INT(control);
     control = USLOSS_TERM_CTRL_RECV_INT(control);
@@ -93,10 +75,11 @@ void phase4_start_service_processes(void)
 }
 
 int TerminalDeviceDriver(char *arg) {
-    //USLOSS_Console("calling terminal device driver\n");
     int unitID = atoi(arg);
     int status;
-
+    char buff[MAXLINE] = "";
+    int length = 0;
+    
     while (1) {
         waitDevice(USLOSS_TERM_DEV, unitID, &status); 
     
@@ -105,27 +88,16 @@ int TerminalDeviceDriver(char *arg) {
 
             // get character from status register
             char receivedChar = USLOSS_TERM_STAT_CHAR(status);
+            buff[length] = receivedChar;
+            length += 1;
 
-            int index = readBufferInUse[unitID];
+            // deliver buffer to kernRead if new line character or buffer size reached limit
+            if (receivedChar == '\n' || length == MAXLINE) {
 
-            // check if the buffer is in use
-            if (index < 10) {
-
-                // save character to buffer that can be globally accessed
-                ReadBuffer *buff = &readBuffers[unitID][index];
-                buff->data[buff->length++] = receivedChar;
-                buff->data[buff->length] = '\0'; 
-
-                // deliver buffer to kernRead if new line character or buffer size reached limit
-                if (receivedChar == '\n' || buff->length == MAXLINE) {
-                    // send buffer to mailbox
-                    MboxSend(readBuffersMbox[unitID], buff, sizeof(ReadBuffer));
-
-                    // reset buffer for new data
-                    buff->length = 0; 
-                    // move to the next buffer
-                    readBufferInUse[unitID] = (index + 1) % 10; 
-                }
+                // send buffer to mailbox
+                MboxCondSend(readBuffersMbox[unitID], buff, length);
+                strcpy(buff, "");
+                length = 0;
             }
         }
 
@@ -133,7 +105,6 @@ int TerminalDeviceDriver(char *arg) {
         if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY) {
             MboxCondSend(writeRequestMboxIDs[unitID], NULL, 0);
         }
-        
     }
 
     return 0;
@@ -146,18 +117,18 @@ int kernTermRead(char *buffer, int bufferSize, int unitID, int *numCharsRead)
         return -1; 
     }
 
-    ReadBuffer readBuff;
-    int result = MboxRecv(readBuffersMbox[unitID], &readBuff, sizeof(ReadBuffer));
+    char readBuff[MAXLINE+1];
+    *numCharsRead = MboxRecv(readBuffersMbox[unitID], readBuff, MAXLINE);
 
-    if (result < 0) {
-        return 0;
-    } else {
-        int copyLength = (bufferSize - 1 < readBuff.length) ? bufferSize - 1 : readBuff.length;
-        strncpy(buffer, readBuff.data, copyLength);
-        buffer[copyLength] = '\0';
-        *numCharsRead = copyLength; 
+    // copy only characters up to bufferSize given by user
+    memcpy(buffer, readBuff, bufferSize);
+
+    // set number of characters read to bufferSize since we only copied a max of bufferSize characters
+    if (*numCharsRead > bufferSize){
+        *numCharsRead = bufferSize;
+        
     }
-
+    buffer[*numCharsRead] = '\0';
     return 0;
 }
 
@@ -195,9 +166,7 @@ void termReadHandler(USLOSS_Sysargs *sysargs) {
     int unitID = (int)(long)sysargs->arg3;
     int numCharsRead = 0;
     
-    //lock(termReadLocks[unitID]);
     int res = kernTermRead(buffer, bufferSize, unitID, &numCharsRead);
-    //unlock(termReadLocks[unitID]);
 
     sysargs->arg2 = (void *)(long) numCharsRead;
     sysargs->arg4 = (void *)(long) res;
@@ -211,9 +180,10 @@ void termWriteHandler(USLOSS_Sysargs *sysargs) {
     int unitID = (int)(long)sysargs->arg3;
     int numCharsWritten = 0;
 
-    //USLOSS_Console("acquiring lockkernTermWrite\n");
+    //USLOSS_Console("acquiring lock kernTermWrite for unit %d\n", unitID);
     lock(termWriteLocks[unitID]);
     int res = kernTermWrite(buffer, bufferSize, unitID, &numCharsWritten);
+   // USLOSS_Console("releading lock kernTermWritefor unit %d\n", unitID);
     unlock(termWriteLocks[unitID]);
 
     sysargs->arg2 = (void *)(long) numCharsWritten;
@@ -262,12 +232,13 @@ int kernSleep(int seconds)
     int wakeup_tick = clock_ticks + (seconds * 10);
     int cur_pid = getpid();
 
+    // save data into struct
     SleepProc *request = &sleepTable[cur_pid % MAXPROC];
     request->pid = cur_pid;
     request->wakeupTime = wakeup_tick;
     request->next = NULL;
 
-    // add to sleep queue
+    // add struct to sleep queue
     if (sleepQueue == NULL) {
         sleepQueue = request;
     } 
